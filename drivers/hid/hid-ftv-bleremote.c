@@ -26,6 +26,12 @@
 #include <asm/uaccess.h>
 #include <linux/miscdevice.h>
 #include <linux/spinlock.h>
+#include <linux/version.h>
+#ifdef CONFIG_AMAZON_METRICS_LOG
+#include <linux/ktime.h>
+#include <linux/hrtimer.h>
+#include <linux/metricslog.h>
+#endif
 #include "hid-ids.h"
 #define ftv_remote_log(...) pr_info("snd_atvr: " __VA_ARGS__)
 
@@ -86,6 +92,12 @@ struct ftv_remote_device {
 	unsigned short voice_active;
 	struct hid_device *hdev;
 	unsigned short audio_state_started;
+#ifdef CONFIG_AMAZON_METRICS_LOG
+	ktime_t voice_key_down_time;
+	ktime_t voice_key_up_time;
+	ktime_t voice_start_time;
+	ktime_t voice_stop_time;
+#endif
 };
 
 struct ftv_remote_drvdata {
@@ -114,6 +126,35 @@ void audio_buffer_stream_write(const void *raw_input_buffer, unsigned int size);
 static void process_opus_audio_data(unsigned char *raw_input, unsigned int size);
 static void process_adpcm_audio_data(unsigned char *raw_input, unsigned int size);
 
+#ifdef CONFIG_AMAZON_METRICS_LOG
+#define METRICS_META_DATA_MAX_LEN 256
+static const char * voice_latency_labels[] = {
+	"0-100ms",
+	"100-200ms",
+	"200-300ms",
+	"300-400ms",
+	"400-500ms",
+	"500-600ms",
+	"600-700ms",
+	"700-800ms",
+	"800-900ms",
+	"900-1000ms",
+	"1000-1100ms",
+	"1100-1200ms",
+	"1200-1300ms",
+	"1300-1400ms",
+	"1400-1500ms",
+	">1500ms",
+};
+static const char * get_voice_latency_label(int delta) {
+	int index = delta / 100;
+	if (index < 0)
+		index = 0;
+	else if (index > 15)
+		index = 15;
+	return voice_latency_labels[index];
+}
+#endif
 
 #ifdef TPUT_TESTING
 void calculate_tput(unsigned long data)
@@ -123,10 +164,14 @@ void calculate_tput(unsigned long data)
 	if (bleremote_dev.hdev != NULL) {
 		if (test_started) {
 		/* stop the test */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0))
+			hid_hw_output_report(bleremote_dev.hdev, audio_stop, sizeof(audio_stop));
+#else
 			bleremote_dev.hdev->hid_output_raw_report(bleremote_dev.hdev,
 							audio_stop,
 							sizeof(audio_stop),
 							HID_OUTPUT_REPORT);
+#endif
 			test_started = 0;
 			tput_avg += tput_bytes_received;
 			dbg_hid("ftvremote: Current Throughput (10s): %lu.%lu Kbps\n ",
@@ -145,10 +190,14 @@ void calculate_tput(unsigned long data)
 		count++;
 		tput_bytes_received = 0;
 		/* start the test */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0))
+		hid_hw_output_report(bleremote_dev.hdev, audio_start, sizeof(audio_start));
+#else
 		bleremote_dev.hdev->hid_output_raw_report(bleremote_dev.hdev,
 							audio_start,
 							sizeof(audio_start),
 							HID_OUTPUT_REPORT);
+#endif
 		}
 		tput_timer.expires = jiffies + msecs_to_jiffies(10000);
 		add_timer(&tput_timer);
@@ -310,44 +359,45 @@ unlock:
 
 static int bleremote_audio_dev_open(struct inode *inode, struct file *file)
 {
-	int ret;
 	dbg_hid("ftvremote: bleremote_audio_dev_open\n");
-	mutex_lock(&audio_rw_lock);
-	if ((bleremote_dev.voice_active == true) && (bleremote_dev.hdev != NULL)) {
-		ret = bleremote_dev.hdev->hid_output_raw_report(bleremote_dev.hdev,
-			audio_start, sizeof(audio_start), HID_OUTPUT_REPORT);
-		if (ret < 0)
-			dbg_hid("ftvremote:Audio Start Output report failed\n");
-		else
-			bleremote_dev.audio_state_started = true;
-	}
-	mutex_unlock(&audio_rw_lock);
+#ifdef CONFIG_AMAZON_METRICS_LOG
+	bleremote_dev.voice_start_time = ktime_get();
+#endif
 	return 0;
 }
 
 static int bleremote_audio_dev_close(struct inode *inode, struct file *file)
 {
-	int ret;
 	dbg_hid("ftvremote: bleremote_audio_dev_close\n");
-	mutex_lock(&audio_rw_lock);
-	if ((bleremote_dev.hdev != NULL) && (bleremote_dev.audio_state_started == true)) {
-	ret = bleremote_dev.hdev->hid_output_raw_report(bleremote_dev.hdev,
-		audio_stop, sizeof(audio_stop), HID_OUTPUT_REPORT);
-		if (ret < 0)
-			dbg_hid("ftvremote:Audio Start Output report failed\n");
-		else
-			bleremote_dev.audio_state_started = false;
+#ifdef CONFIG_AMAZON_METRICS_LOG
+	{
+		char metadata[METRICS_META_DATA_MAX_LEN];
+		int pressed_time;
+		int record_time;
+		int start_delay;
+		int stop_delay;
 
-		/* Hold raw device pointer for active remote unless voice search key is released */
-		/* for the case that open/close is called multiple times after voice search key is pressed */
-		if (bleremote_dev.voice_active == false) {
-			bleremote_dev.hdev = NULL;
-		}
+		bleremote_dev.voice_stop_time = ktime_get();
+		pressed_time = (int)ktime_to_ms(ktime_sub(bleremote_dev.voice_key_up_time,
+			bleremote_dev.voice_key_down_time));
+		record_time = (int)ktime_to_ms(ktime_sub(bleremote_dev.voice_stop_time,
+			bleremote_dev.voice_start_time));
+		start_delay = (int)ktime_to_ms(ktime_sub(bleremote_dev.voice_start_time,
+			bleremote_dev.voice_key_down_time));
+		stop_delay = (int)ktime_to_ms(ktime_sub(bleremote_dev.voice_stop_time,
+			bleremote_dev.voice_key_up_time));
+		snprintf(metadata, METRICS_META_DATA_MAX_LEN,
+				"!{\"d\"#{\"%s\"#\"%s\"$\"%s\"#\"%s\"$\"%s\"#\"%s\"$\"%s\"#\"%s\"}}",
+				"voice_key_pressed_time", get_voice_latency_label(pressed_time),
+				"voice_data_record_time", get_voice_latency_label(record_time),
+				"voice_record_start_delay", get_voice_latency_label(start_delay),
+				"voice_record_stop_delay", get_voice_latency_label(stop_delay));
+		log_counter_to_vitals(ANDROID_LOG_INFO,  "Kernel",
+				"remote-wireless", "bt-ble-voicesearch",
+				"voice-started", 1, "count",
+				metadata, VITALS_NORMAL);
 	}
-	mutex_unlock(&audio_rw_lock);
-	pr_warn("%s: Buffer Underrun packet loss count %u\n",
-			__func__, raw_audio_buffer_stream.underrun_count);
-	audio_buffer_stream_reset();
+#endif
 	return 0;
 }
 
@@ -416,7 +466,7 @@ static int ftv_remote_raw_event(struct hid_device *hdev, struct hid_report *repo
 {
 
 	unsigned short *keycode;
-	int i, ret;
+	int i;
 	struct ftv_remote_drvdata *remote_drvdata = hid_get_drvdata(hdev);
 	dbg_hid("ftvremote: %s\n", __func__);
 #if (DEBUG_HID_RAW_INPUT == 1)
@@ -459,21 +509,77 @@ static int ftv_remote_raw_event(struct hid_device *hdev, struct hid_report *repo
 			if (bleremote_dev.voice_active == true)
 			return 1;
 			else {
+				int ret;
 				audio_buffer_stream_reset();
 				bleremote_dev.voice_active = true;
 				bleremote_dev.hdev = hdev;
+#ifdef CONFIG_AMAZON_METRICS_LOG
+				bleremote_dev.voice_key_down_time = ktime_get();
+#endif
 				dbg_hid("ftvremote: ftv_remote_raw_event voice active: TRUE device %p\n",
 					bleremote_dev.hdev);
+
+
+				mutex_lock(&audio_rw_lock);
+
+			#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0))
+				ret = hid_hw_output_report(bleremote_dev.hdev, audio_start, sizeof(audio_start));
+			#else
+				ret = bleremote_dev.hdev->hid_output_raw_report(bleremote_dev.hdev,
+					audio_start, sizeof(audio_start), HID_OUTPUT_REPORT);
+			#endif
+				if (ret < 0)
+					dbg_hid("ftvremote:Audio Start Output report failed\n");
+				else
+					bleremote_dev.audio_state_started = true;
+
+				mutex_unlock(&audio_rw_lock);
 			}
 		break;
 
 		case 0x00:
 			if ((bleremote_dev.voice_active == true) && (bleremote_dev.hdev == hdev)) {
+				int ret;
+
+				mutex_lock(&audio_rw_lock);
+
+			#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 15, 0))
+				ret = hid_hw_output_report(bleremote_dev.hdev, audio_stop, sizeof(audio_stop));
+			#else
+				ret = bleremote_dev.hdev->hid_output_raw_report(bleremote_dev.hdev,
+					audio_stop, sizeof(audio_stop), HID_OUTPUT_REPORT);
+			#endif
+				if (ret < 0)
+					dbg_hid("ftvremote:Audio Start Output report failed\n");
+				else
+					bleremote_dev.audio_state_started = false;
+
+				mutex_unlock(&audio_rw_lock);
+
 				dbg_hid("ftvremote: ftv_remote_raw_event voice active: FALSE device %p\n",
 					bleremote_dev.hdev);
 				pr_warn("%s: Buffer Underrun packet loss count %u\n",
 					__func__, raw_audio_buffer_stream.underrun_count);
+
 				bleremote_dev.voice_active = false;
+				bleremote_dev.hdev = NULL;
+
+#ifdef CONFIG_AMAZON_METRICS_LOG
+				bleremote_dev.voice_key_up_time = ktime_get();
+
+				if (!bleremote_dev.audio_state_started) {
+					char metadata[METRICS_META_DATA_MAX_LEN];
+					int pressed_time = (int)ktime_to_ms(ktime_sub(bleremote_dev.voice_key_up_time,
+						bleremote_dev.voice_key_down_time));
+					snprintf(metadata, METRICS_META_DATA_MAX_LEN,
+						 "!{\"d\"#{\"%s\"#\"%s\"}}", "voice_key_pressed_time",
+						 get_voice_latency_label(pressed_time));
+					log_counter_to_vitals(ANDROID_LOG_INFO,  "Kernel",
+						"remote-wireless", "bt-ble-voicesearch",
+						"voice-not-started", 1, "count",
+						metadata, VITALS_NORMAL);
+				}
+#endif
 			}
 		break;
 		}
@@ -663,6 +769,10 @@ static const struct hid_device_id ftv_remote_devices[] = {
 	{HID_USB_DEVICE(BT_VENDOR_ID_LAB126, BT_DEVICE_ID_LAB126_HOWARD)},
 	{HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_LAB126, BT_DEVICE_ID_LAB126_PENNY)},
 	{HID_USB_DEVICE(BT_VENDOR_ID_LAB126, BT_DEVICE_ID_LAB126_PENNY)},
+	{HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_LAB126, BT_DEVICE_ID_LAB126_EIGER)},
+	{HID_USB_DEVICE(BT_VENDOR_ID_LAB126, BT_DEVICE_ID_LAB126_EIGER)},
+	{HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_LAB126, BT_DEVICE_ID_LAB126_PICO)},
+	{HID_USB_DEVICE(BT_VENDOR_ID_LAB126, BT_DEVICE_ID_LAB126_PICO)},
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, ftv_remote_devices);
